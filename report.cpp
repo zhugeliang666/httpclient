@@ -634,153 +634,168 @@ string GetSystemUptime() {
 }
 
 
-// 初始化 COM 库
-void InitializeCOM() {
-	HRESULT hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+// 初始化 COM 库和设置 WMI 服务
+void InitializeWMI(IWbemServices** pSvc, IWbemLocator** pLoc) {
+	HRESULT hres;
+
+	// 初始化 COM 库
+	hres = CoInitializeEx(0, COINIT_MULTITHREADED);
 	if (FAILED(hres)) {
-		cout << "Failed to initialize COM library. Exiting..." << endl;
+		std::cerr << "COM initialization failed!" << std::endl;
+		exit(1);
+	}
+
+	// 设置 COM 安全性
+	hres = CoInitializeSecurity(
+		NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+		NULL, EOAC_NONE, NULL);
+	if (FAILED(hres)) {
+		std::cerr << "Failed to initialize security!" << std::endl;
+		CoUninitialize();
+		exit(1);
+	}
+
+	// 创建 IWbemLocator 对象
+	hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)pLoc);
+	if (FAILED(hres)) {
+		std::cerr << "Failed to create IWbemLocator object!" << std::endl;
+		CoUninitialize();
+		exit(1);
+	}
+
+	// 连接到 WMI 服务
+	hres = (*pLoc)->ConnectServer(
+		BSTR(L"ROOT\\CIMV2"), // WMI 命名空间
+		NULL, NULL, 0, NULL, 0, 0, pSvc);
+	if (FAILED(hres)) {
+		std::cerr << "Failed to connect to WMI!" << std::endl;
+		(*pLoc)->Release();
+		CoUninitialize();
+		exit(1);
+	}
+
+	// 设置 WMI 代理安全性
+	hres = CoSetProxyBlanket(
+		*pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+		RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+	if (FAILED(hres)) {
+		std::cerr << "Failed to set proxy blanket!" << std::endl;
+		(*pSvc)->Release();
+		(*pLoc)->Release();
+		CoUninitialize();
 		exit(1);
 	}
 }
 
 // 获取网卡设备信息
-void GetNetworkAdapters() {
-	InitializeCOM();
-	// 设置 COM 连接到 WMI
-	IWbemLocator* pLoc = NULL;
-	IWbemServices* pSvc = NULL;
-
-	HRESULT hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
-	if (FAILED(hres)) {
-		cout << "Failed to create IWbemLocator object. Exiting..." << endl;
-		CoUninitialize();
-		exit(1);
-	}
-
-	// 连接到 WMI 命名空间
-	hres = pLoc->ConnectServer(
-		_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
-	if (FAILED(hres)) {
-		cout << "Failed to connect to WMI. Exiting..." << endl;
-		pLoc->Release();
-		CoUninitialize();
-		exit(1);
-	}
-
-	// 设置 WMI 查询的安全性
-	hres = CoSetProxyBlanket(
-		pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
-	if (FAILED(hres)) {
-		cout << "Failed to set proxy blanket. Exiting..." << endl;
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
-		exit(1);
-	}
-
+string QueryNetworkAdapters(IWbemServices* pSvc) {
+	
+	HRESULT hres;
 	// 查询网络适配器配置（Win32_NetworkAdapterConfiguration）
 	IEnumWbemClassObject* pEnumerator = NULL;
 	hres = pSvc->ExecQuery(
 		bstr_t("WQL"), bstr_t("SELECT * FROM Win32_NetworkAdapter"),
 		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
 	if (FAILED(hres)) {
-		cout << "Failed to query WMI. Exiting..." << endl;
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
-		exit(1);
+		cout << "[NA][/NA][NPA][/NPA]" << endl;
+	
 	}
 
 	// 获取查询结果
 	IWbemClassObject* pclsObj = NULL;
 	ULONG uReturn = 0;
+	wstring NPAText = L"";
+	wstring NAText = L"";
 	while (pEnumerator) {
 		hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
 		if (0 == uReturn) break;
-
+		wstring name = L"";
+		wstring mac = L"";
+		bool physical = false;
 		VARIANT vtProp;
 		// 获取网卡名称
 		hres = pclsObj->Get(L"Description", 0, &vtProp, 0, 0);
-		if (FAILED(hres)) {
-			cout << "Failed to get Description." << endl;
-		}
-		else {
-			wcout << L"Network Adapter: " << vtProp.bstrVal << endl;
-		}
-		VariantClear(&vtProp);
-		VARIANT vtProp2;
-		// 获取 MAC 地址
-		hres = pclsObj->Get(L"MACAddress", 0, &vtProp2, 0, 0);
-		if (FAILED(hres)) {
-			cout << "Failed to get MACAddress." << endl;
-		}
-		else {
-			// 检查 vtProp 是否为空
-			if (vtProp2.vt == VT_EMPTY || vtProp2.vt == VT_NULL) {
+		if (SUCCEEDED(hres)) {
+			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
 				continue;
 			}
-			wcout << L"MAC Address: " << vtProp2.bstrVal << endl;
+			name = std::wstring(vtProp.bstrVal);
+		
+
 		}
-		VariantClear(&vtProp2);
+		
+		VariantClear(&vtProp);
+		// 获取 MAC 地址
+		hres = pclsObj->Get(L"MACAddress", 0, &vtProp, 0, 0);
+		if (SUCCEEDED(hres)) {
+			// 检查 vtProp 是否为空
+			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
+				continue;
+			}
+			mac = std::wstring(vtProp.bstrVal);
+		}
+		VariantClear(&vtProp);
+		
+
+		// 获取设备是否为物理设备的标志
+		hres = pclsObj->Get(L"PhysicalAdapter", 0, &vtProp, 0, 0);
+		if (SUCCEEDED(hres)) {
+	 
+			physical = vtProp.boolVal;
+		}
+		VariantClear(&vtProp);
+		wstring tempNPAText = L"";
+		wstring tempNaText = L"";
+		tempNaText =  L"<NAPN>" + name + L"</NAPN>";
+		if (physical) {
+			tempNaText = tempNaText + L"<NAPA>True</NAPA>";
+		}
+		else {
+			tempNaText = tempNaText + L"<NAPA>False</NAPA>";
+		}
+		mac.erase(std::remove(mac.begin(), mac.end(), ':'), mac.end());
+
+		tempNPAText = L"<EPAIN>" + name + L"</EPAIN><EPANPAA>"+mac+L"</EPANPAA>";
+
+
+		NPAText = NPAText + tempNPAText + L"\r\n";
+		NAText = NAText + tempNaText + L"\r\n";
+
 
 		pclsObj->Release();
 	}
 
+	std::wstring wideStr(NPAText);
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string NPAText2(size_needed, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &NPAText2[0], size_needed, nullptr, nullptr);
+
+
+	std::wstring wideStr2(NAText);
+	int size_needed2 = WideCharToMultiByte(CP_UTF8, 0, wideStr2.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string NAText2(size_needed2, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wideStr2.c_str(), -1, &NAText2[0], size_needed2, nullptr, nullptr);
+
+	return "[NA]" + NAText2 + "[/NA]\r\n[NPA]" + NPAText2 +"[/NPA]";
+
 	// 清理
 	pEnumerator->Release();
-	pSvc->Release();
-	pLoc->Release();
-	CoUninitialize();
 }
 
 
 
 
 // 获取 CPU 信息
-string GetCPUInfo() {
-	InitializeCOM();
-	// 设置 COM 连接到 WMI
-	IWbemLocator* pLoc = NULL;
-	IWbemServices* pSvc = NULL;
+string GetCPUInfo(IWbemServices* pSvc) {
 
-	HRESULT hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
-	if (FAILED(hres)) {
-	
-		CoUninitialize();
-		return  "[SYS]<CSNP>0</CSNP><CSNLP>0</CSNLP>[/SYS][CPU][/CPU]";
-	}
-
-	// 连接到 WMI 命名空间
-	hres = pLoc->ConnectServer(
-		_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
-	if (FAILED(hres)) {
-	
-		pLoc->Release();
-		CoUninitialize();
-		return  "[SYS]<CSNP>0</CSNP><CSNLP>0</CSNLP>[/SYS][CPU][/CPU]";
-	}
-
-	// 设置 WMI 查询的安全性
-	hres = CoSetProxyBlanket(
-		pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
-	if (FAILED(hres)) {
-	
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
-		return  "[SYS]<CSNP>0</CSNP><CSNLP>0</CSNLP>[/SYS][CPU][/CPU]";
-	}
-
+	HRESULT hres;
 	// 查询 CPU 信息
 	IEnumWbemClassObject* pEnumerator = NULL;
 	hres = pSvc->ExecQuery(
 		bstr_t("WQL"), bstr_t("SELECT * FROM Win32_Processor"),
 		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
 	if (FAILED(hres)) {
-	
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
+
 		return  "[SYS]<CSNP>0</CSNP><CSNLP>0</CSNLP>[/SYS][CPU][/CPU]";
 	}
 
@@ -789,8 +804,8 @@ string GetCPUInfo() {
 	ULONG uReturn = 0;
 	int NumberOfCores = 0;
 	int NumberOfLogicalProcessors = 0;
-	string cpuNameText = "";
-	string deviceIdText = "";
+	wstring cpuNameText = L"";
+	wstring deviceIdText = L"";
 	string result = "";
 	while (pEnumerator) {
 		hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
@@ -800,22 +815,15 @@ string GetCPUInfo() {
 
 		hres = pclsObj->Get(L"Name", 0, &vtProp, 0, 0);
 		if (SUCCEEDED(hres)) {
-			std::wstring wideStr(vtProp.bstrVal);
-			int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-			std::string cpuName(size_needed, 0);
-			WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &cpuName[0], size_needed, nullptr, nullptr);
-			cpuNameText = cpuName;
+			cpuNameText = std::wstring(vtProp.bstrVal);
 
 		}
 		VariantClear(&vtProp);
 
 		hres = pclsObj->Get(L"DeviceId", 0, &vtProp, 0, 0);
 		if (SUCCEEDED(hres)) {
-			std::wstring wideStr(vtProp.bstrVal);
-			int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-			std::string deviceId(size_needed, 0);
-			WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &deviceId[0], size_needed, nullptr, nullptr);
-			deviceIdText = deviceId;
+		
+			deviceIdText = std::wstring(vtProp.bstrVal);
 		}
 		VariantClear(&vtProp);
 		string NumberOfCoresText = "";
@@ -848,41 +856,61 @@ string GetCPUInfo() {
 		}
 		
 		VariantClear(&vtProp);
-		result = result + "<PDID>" + deviceIdText + "</PDID><PN>" + cpuNameText + "</PN>"+ NumberOfCoresText+ NumberOfLogicalProcessorsText+"\r\n";
+
+		std::wstring wideStr(L"<PDID>" + deviceIdText + L"</PDID><PN>" + cpuNameText + L"</PN>" );
+		int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		std::string result2(size_needed, 0);
+		WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &result2[0], size_needed, nullptr, nullptr);
+		result = result + result2 + NumberOfCoresText+ NumberOfLogicalProcessorsText+"\r\n";
 		pclsObj->Release();
 
 	}
 
 	// 清理
 	pEnumerator->Release();
-	pSvc->Release();
-	pLoc->Release();
-	CoUninitialize();
 	return "[SYS]<CSNP>" + std::to_string(NumberOfCores) + "</CSNP><CSNLP>" + std::to_string(NumberOfLogicalProcessors) + "</CSNLP>[/SYS]\r\n[CPU]"+ result+"[/CPU]";
 }
 
+// 释放资源
+void CleanUpWMI(IWbemServices* pSvc, IWbemLocator* pLoc) {
+	if (pSvc) pSvc->Release();
+	if (pLoc) pLoc->Release();
+	CoUninitialize();
+}
+
 void report() {
+	IWbemServices* pSvc = NULL;
+	IWbemLocator* pLoc = NULL;
+	InitializeWMI(&pSvc, &pLoc);
 	string systemInfo = "[SystemInfo]\r\n";
 	//[NT]10.0.19045.5607[/NT]
 	string windowVersion = GetWindowsVersion();
 	systemInfo.append("[" + windowVersion + "]\r\n");
 	//[SYS]<CSMf>HASEE Computer</CSMf><CSM>CNH5S</CSM><CSTPM>16948453376</CSTPM><CSNP>1</CSNP><CSNLP>16</CSNLP>
 	string sysProcessor = "";
-	string processorCoresInfoText =  GetCPUInfo();
+	string processorCoresInfoText =  GetCPUInfo(pSvc);
 	sysProcessor = sysProcessor + processorCoresInfoText;
 	systemInfo.append(sysProcessor);
 	//[UPTimeTick]750484[/UPTimeTick]
 	//[UPTime] 0d0h12m30s[/ UPTime]
 	string systemUpTimeText =  "\r\n[UPTime]"+GetSystemUptime()+"[/UPTime]";
 	string systemInstallDateText =  "\r\n[OSInstallDate]" +  GetInstallDate() + "[/OSInstallDate]";
-	systemInfo.append(systemUpTimeText + systemInstallDateText);
-
-
-
+	systemInfo.append(systemUpTimeText + systemInstallDateText+"\r\n");
+	//[NA] <NAPN>WAN Miniport(IP) < / NAPN > <NAPA>False< / NAPA>
+	//	<NAPN>WAN Miniport(IPv6) < / NAPN > <NAPA>False< / NAPA>
+	//	<NAPN>Intel(R) Wireless - AC 9462 < / NAPN > <NAPA>True< / NAPA>
+	//	<NAPN>WAN Miniport(Network Monitor) < / NAPN > <NAPA>False< / NAPA>
+	//	<NAPN>Microsoft Wi - Fi Direct Virtual Adapter< / NAPN><NAPA>False< / NAPA>
+	//	<NAPN>Microsoft Wi - Fi Direct Virtual Adapter< / NAPN><NAPA>False< / NAPA>
+	//	<NAPN>Intel(R) Ethernet Connection(14) I219 - V< / NAPN><NAPA>True< / NAPA>
+	//	<NAPN>Bluetooth Device(Personal Area Network) < / NAPN > <NAPA>True< / NAPA>
+	string networkAdaptersText =   QueryNetworkAdapters(pSvc);
+	systemInfo.append(networkAdaptersText);
 	std::cout << systemInfo << std::endl;
+
+	CleanUpWMI(pSvc, pLoc);
 	return;
 
-	GetNetworkAdapters();
 
 
 	return;
