@@ -1,43 +1,9 @@
 ﻿// HttpClient.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
 //
-#include "json.hpp"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <wincrypt.h>
-#include <intrin.h>
-#include <versionhelpers.h>
-#include <tlhelp32.h>
-#include <curl/curl.h>
-#include <iostream>  // 引入标准输入输出库
-#undef max
-#include <limits>
-#include <string>
-#include <sstream>
-#include <iomanip>
-#include <random>
-#include <ctime>
-#include <bitset>
-#include <cstring>
-
-#include <iphlpapi.h>
-
-#include <fstream>
-#include <vector>
-#include <locale>
-#include <codecvt>
-#include <chrono>
-
 #include "report.h"
 
-using namespace std;
 
-#pragma comment(lib,"user32.lib")
-#pragma comment(lib,"kernel32.lib")
-#pragma comment(lib,"Advapi32.lib")
+using namespace std;
 
 
 std::string user_key = "";

@@ -1,27 +1,6 @@
 
 
-#include <windows.h>
-#include <iostream>
-#include <gdiplus.h>  // 用于图像保存（GDI+）
-#include <vector>
-#include <memory>
-#include <fstream>
-#include <sstream>
-
-#include <winternl.h>
-#include "zlib.h"
-#pragma comment(lib, "gdiplus.lib")
-#include <nmmintrin.h>  // 包含支持 POPCNT 指令的头文件
-
-#include <stdio.h>
-#include <stdlib.h>
-
-#include <cstdio>
-#include <cstring>
-#include <comdef.h>
-#include <Wbemidl.h>
-#pragma comment(lib, "wbemuuid.lib")
-
+#include "report.h"
 
 
 #define CpuNum "wmic cpu get DeviceID"
@@ -89,6 +68,108 @@
     "wmic cpu get VirtualizationFirmwareEnabled"
 #define __VMMonitorModeExtensions "wmic cpu get VMMonitorModeExtensions"
 #define __VoltageCaps "wmic cpu get VoltageCaps"
+
+
+// 读取 uint8/uint16 的标量
+static ULONG GetULongProp(IWbemClassObject* obj, LPCWSTR name, ULONG defVal = 0) {
+	VARIANT vt; VariantInit(&vt);
+	ULONG v = defVal;
+	if (SUCCEEDED(obj->Get(name, 0, &vt, nullptr, nullptr))) {
+		if (vt.vt == VT_UI1) v = vt.bVal;            // WeekOfManufacture（byte）
+		else if (vt.vt == VT_UI2) v = vt.uiVal;      // YearOfManufacture（uint16）
+		else if (vt.vt == VT_I4) v = (ULONG)vt.lVal; // 兼容某些实现
+		else if (vt.vt == VT_BSTR && vt.bstrVal) v = (ULONG)_wtol(vt.bstrVal);
+	}
+	VariantClear(&vt);
+	return v;
+}
+
+
+
+
+
+// 打印 UINT16 数组为“空格分隔的十进制”，示例：83 71 84 0 ...
+static std::wstring GetUInt16ArrayStrProp(IWbemClassObject* obj, LPCWSTR name) {
+	VARIANT vt; VariantInit(&vt);
+	std::wstring result;
+
+	if (SUCCEEDED(obj->Get(name, 0, &vt, nullptr, nullptr)) &&
+		(vt.vt & VT_ARRAY) && (vt.vt & VT_UI2) && vt.parray) {
+		SAFEARRAY* sa = vt.parray;
+		LONG l = 0, u = -1;
+		SafeArrayGetLBound(sa, 1, &l);
+		SafeArrayGetUBound(sa, 1, &u);
+		for (LONG i = l; i <= u; ++i) {
+			USHORT val = 0;
+			if (SUCCEEDED(SafeArrayGetElement(sa, &i, &val))) {
+				if (!result.empty()) result += L" ";
+				result += std::to_wstring(val);
+			}
+		}
+
+		return result;
+	}
+	VariantClear(&vt);
+	return L"";
+}
+
+
+
+static bool SafeArrayToBytes(VARIANT& vt, std::vector<uint8_t>& out) {
+	if (!((vt.vt & VT_ARRAY) && (vt.vt & VT_UI1)) || !vt.parray) return false;
+	SAFEARRAY* sa = vt.parray;
+	LONG l = 0, u = -1;
+	if (FAILED(SafeArrayGetLBound(sa, 1, &l)) || FAILED(SafeArrayGetUBound(sa, 1, &u)) || u < l) return false;
+	out.resize(size_t(u - l + 1));
+	for (LONG i = l; i <= u; ++i) {
+		BYTE v = 0; if (FAILED(SafeArrayGetElement(sa, &i, &v))) return false;
+		out[size_t(i - l)] = v;
+	}
+	return true;
+}
+
+
+// 读取 BSTR/VARIANT 为宽字符串
+static std::wstring GetBstrProp(IWbemClassObject* obj, LPCWSTR name) {
+	VARIANT vt; VariantInit(&vt);
+	if (SUCCEEDED(obj->Get(name, 0, &vt, nullptr, nullptr)) && vt.vt == VT_BSTR && vt.bstrVal) {
+		std::wstring s = vt.bstrVal;
+		VariantClear(&vt);
+		return s;
+	}
+	VariantClear(&vt);
+	return L"";
+}
+
+static ULONGLONG GetU64Prop(IWbemClassObject* obj, LPCWSTR name) {
+	VARIANT vt; VariantInit(&vt);
+	ULONGLONG v = 0;
+	if (SUCCEEDED(obj->Get(name, 0, &vt, nullptr, nullptr))) {
+		if (vt.vt == VT_BSTR && vt.bstrVal) { // WMI 的 Size 常是字符串
+			v = _wcstoui64(vt.bstrVal, nullptr, 10);
+		}
+		else if (vt.vt == VT_I8) {
+			v = static_cast<ULONGLONG>(vt.llVal);
+		}
+		else if (vt.vt == VT_UI8) {
+			v = vt.ullVal;
+		}
+	}
+	VariantClear(&vt);
+	return v;
+}
+
+static bool GetBoolProp(IWbemClassObject* obj, LPCWSTR name, bool defval = false) {
+	VARIANT vt; VariantInit(&vt);
+	bool ret = defval;
+	if (SUCCEEDED(obj->Get(name, 0, &vt, nullptr, nullptr))) {
+		if (vt.vt == VT_BOOL) ret = (vt.boolVal == VARIANT_TRUE);
+		else if (vt.vt == VT_I4) ret = (vt.lVal != 0);
+	}
+	VariantClear(&vt);
+	return ret;
+}
+
 
 
 // 定义 RtlGetVersion 函数类型
@@ -649,7 +730,7 @@ void InitializeWMI(IWbemServices** pSvc, IWbemLocator** pLoc) {
 	hres = CoInitializeSecurity(
 		NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
 		NULL, EOAC_NONE, NULL);
-	if (FAILED(hres)) {
+	if (FAILED(hres) && hres != RPC_E_TOO_LATE) {
 		std::cerr << "Failed to initialize security!" << std::endl;
 		CoUninitialize();
 		exit(1);
@@ -685,11 +766,137 @@ void InitializeWMI(IWbemServices** pSvc, IWbemLocator** pLoc) {
 		CoUninitialize();
 		exit(1);
 	}
+
 }
+
+
+
+std::string wStrToStr(wstring wstr) {
+	std::wstring wideStr(wstr);
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string str(size_needed, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &str[0], size_needed, nullptr, nullptr);
+	return str;
+}
+
+
+//获取GPU信息
+string QueryGPU(IWbemServices* pSvc) {
+
+	wstringstream ostr;
+	HRESULT hres;
+	// 执行查询：Win32_VideoController
+	IEnumWbemClassObject* pEnumerator = NULL;
+	hres = pSvc->ExecQuery(
+		bstr_t("WQL"),
+		bstr_t("SELECT AdapterCompatibility, Caption, Description, Name, PNPDeviceID,DeviceId, VideoProcessor FROM Win32_VideoController"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+		nullptr, &pEnumerator);
+
+	if (FAILED(hres)) {
+		return "[VIDEO]" + wStrToStr(ostr.str()) + "[/VIDEO]";
+	}
+
+	// 读取结果
+	IWbemClassObject* pclsObj = NULL;
+	ULONG uReturn = 0;
+
+	int index = 1;
+	while (pEnumerator) {
+		HRESULT hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+		if (0 == uReturn) break;
+
+
+	
+
+		std::wstring vcac = GetBstrProp(pclsObj, L"AdapterCompatibility");
+		std::wstring vcc = GetBstrProp(pclsObj, L"Caption");
+		std::wstring vcd = GetBstrProp(pclsObj, L"Description");
+		std::wstring vcn = GetBstrProp(pclsObj, L"Name");
+		std::wstring vcpd = GetBstrProp(pclsObj, L"PNPDeviceID");
+		std::wstring vcsn = GetBstrProp(pclsObj, L"DeviceId");
+		std::wstring vcvp = GetBstrProp(pclsObj, L"VideoProcessor");
+
+		ostr << L"<VCAC>" << vcac << L"</VCAC>"
+			<< L"<VCC>" << vcc << L"</VCC>"
+			<< L"<VCD>" << vcd << L"</VCD>"
+			<< L"<VCDID>" << vcsn << L"</VCDID>"
+			<< L"<VCN>" << vcn << L"</VCN>"
+			<< L"<VCPDID>" << vcpd << L"</VCPDID>"
+			<< L"<VCSN>" << vcsn << L"</VCSN>"
+			<< L"<VCVP>" << vcvp << L"</VCVP>\r\n";
+		pclsObj->Release();
+	    index++;
+	}
+	pEnumerator->Release();
+
+
+	return "[VIDEO]"+wStrToStr(ostr.str()) + "[/VIDEO]";
+
+
+}
+
+// 把 WMI ReleaseDate 转成 Hex（如 20240212 → 70120C00）
+static std::wstring DateToHex(const std::wstring& wmiDate) {
+	// WMI 格式: YYYYMMDDHHMMSS.******
+	if (wmiDate.size() < 8) return L"00000000";
+	std::wstring y = wmiDate.substr(0, 4);
+	std::wstring m = wmiDate.substr(4, 2);
+	std::wstring d = wmiDate.substr(6, 2);
+	unsigned yi = std::stoi(y) - 1980; // BIOS Encoded Offset
+	unsigned mi = std::stoi(m);
+	unsigned di = std::stoi(d);
+	unsigned hex = (yi << 9) | (mi << 5) | (di);
+	wchar_t buf[9]; swprintf(buf, 9, L"%08X", hex);
+	return buf;
+}
+
+
+//获取GPU信息
+string QueryBIOS(IWbemServices* pSvc) {
+
+	wstringstream ostr;
+	HRESULT hres;
+	// 执行查询：Win32_VideoController
+	IEnumWbemClassObject* pEnumerator = NULL;
+	hres = pSvc->ExecQuery(bstr_t("WQL"),
+		bstr_t("SELECT SMBIOSBIOSVersion, BIOSVersion, Manufacturer, SerialNumber, ReleaseDate FROM Win32_BIOS"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnumerator);
+	if (FAILED(hres) || !pEnumerator) return  "[BIOS]" + wStrToStr(ostr.str()) + "[/BIOS]";
+
+
+	IWbemClassObject* obj = nullptr; ULONG ret = 0;
+	if (SUCCEEDED(pEnumerator->Next(WBEM_INFINITE, 1, &obj, &ret)) && ret == 1)
+	{
+		std::wstring v1 = GetBstrProp(obj, L"SMBIOSBIOSVersion");
+		std::wstring v2 = GetUInt16ArrayStrProp(obj, L"BIOSVersion");
+		std::wstring man = GetBstrProp(obj, L"Manufacturer");
+		std::wstring sn = GetBstrProp(obj, L"SerialNumber");
+		std::wstring date = GetBstrProp(obj, L"ReleaseDate");
+
+		std::wstring v3 = man + L" - " + DateToHex(date);
+		if (sn.empty()) sn = L"Not Applicable";
+
+		ostr << L"<BIOSV1>" << v1 << L"</BIOSV1>"
+			<< L"<BIOSV2>" << v2 << L"</BIOSV2>"
+			<< L"<BIOSV3>" << v3 << L"</BIOSV3>"
+			<< L"<BIOSSN>" << sn << L"</BIOSSN>\n";
+
+		obj->Release();
+	
+	}
+	pEnumerator->Release();
+
+
+	return "[BIOS]" + wStrToStr(ostr.str()) + "[/BIOS]";
+
+
+}
+
 
 // 获取网卡设备信息
 string QueryNetworkAdapters(IWbemServices* pSvc) {
-	
+
 	HRESULT hres;
 	// 查询网络适配器配置（Win32_NetworkAdapterConfiguration）
 	IEnumWbemClassObject* pEnumerator = NULL;
@@ -697,8 +904,8 @@ string QueryNetworkAdapters(IWbemServices* pSvc) {
 		bstr_t("WQL"), bstr_t("SELECT * FROM Win32_NetworkAdapter"),
 		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
 	if (FAILED(hres)) {
-		cout << "[NA][/NA][NPA][/NPA]" << endl;
-	
+		return "[NA][/NA][NPA][/NPA]";
+
 	}
 
 	// 获取查询结果
@@ -706,80 +913,267 @@ string QueryNetworkAdapters(IWbemServices* pSvc) {
 	ULONG uReturn = 0;
 	wstring NPAText = L"";
 	wstring NAText = L"";
+	wstringstream  naOstr;
+	wstringstream npaOstr;
 	while (pEnumerator) {
 		hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
 		if (0 == uReturn) break;
 		wstring name = L"";
 		wstring mac = L"";
 		bool physical = false;
-		VARIANT vtProp;
 		// 获取网卡名称
-		hres = pclsObj->Get(L"Description", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
-				continue;
-			}
-			name = std::wstring(vtProp.bstrVal);
-		
-
-		}
-		
-		VariantClear(&vtProp);
-		// 获取 MAC 地址
-		hres = pclsObj->Get(L"MACAddress", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-			// 检查 vtProp 是否为空
-			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
-				continue;
-			}
-			mac = std::wstring(vtProp.bstrVal);
-		}
-		VariantClear(&vtProp);
-		
-
-		// 获取设备是否为物理设备的标志
-		hres = pclsObj->Get(L"PhysicalAdapter", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-	 
-			physical = vtProp.boolVal;
-		}
-		VariantClear(&vtProp);
-		wstring tempNPAText = L"";
-		wstring tempNaText = L"";
-		tempNaText =  L"<NAPN>" + name + L"</NAPN>";
-		if (physical) {
-			tempNaText = tempNaText + L"<NAPA>True</NAPA>";
-		}
-		else {
-			tempNaText = tempNaText + L"<NAPA>False</NAPA>";
-		}
-		mac.erase(std::remove(mac.begin(), mac.end(), ':'), mac.end());
-
-		tempNPAText = L"<EPAIN>" + name + L"</EPAIN><EPANPAA>"+mac+L"</EPANPAA>";
 
 
-		NPAText = NPAText + tempNPAText + L"\r\n";
-		NAText = NAText + tempNaText + L"\r\n";
+		wstring Description = GetBstrProp(pclsObj, L"Description");
+		wstring MACAddress = GetBstrProp(pclsObj, L"MACAddress");
+
+		wstring PhysicalAdapter = (GetBoolProp(pclsObj, L"PhysicalAdapter") ? L"True" : L"False");
+
+		naOstr << L"<NAPN>" << Description << "</NAPN><NAPA>" << PhysicalAdapter << "</NAPA>\r\n";
+
+
+		MACAddress.erase(std::remove(MACAddress.begin(), MACAddress.end(), ':'), MACAddress.end());
+
+		npaOstr << L"<EPAIN>" << Description << "</EPAIN><EPANPAA>" << MACAddress << "</EPANPAA>\r\n";
 
 
 		pclsObj->Release();
 	}
 
-	std::wstring wideStr(NPAText);
-	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-	std::string NPAText2(size_needed, 0);
-	WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &NPAText2[0], size_needed, nullptr, nullptr);
 
 
-	std::wstring wideStr2(NAText);
-	int size_needed2 = WideCharToMultiByte(CP_UTF8, 0, wideStr2.c_str(), -1, nullptr, 0, nullptr, nullptr);
-	std::string NAText2(size_needed2, 0);
-	WideCharToMultiByte(CP_UTF8, 0, wideStr2.c_str(), -1, &NAText2[0], size_needed2, nullptr, nullptr);
 
-	return "[NA]" + NAText2 + "[/NA]\r\n[NPA]" + NPAText2 +"[/NPA]";
+	return "[NA]" + wStrToStr(naOstr.str()) + "[/NA]\r\n[NPA]" + wStrToStr(npaOstr.str()) + "[/NPA]";
 
 	// 清理
 	pEnumerator->Release();
+}
+
+
+// 获取 DISPLAY 信息
+string queryDisplay(IWbemServices* pSvc) {
+
+	HRESULT hres;
+	// 查询 CPU 信息
+	IEnumWbemClassObject* pEnumerator = NULL;
+	hres = pSvc->ExecQuery(
+		bstr_t(L"WQL"),
+		// Name、DriverVersion、CurrentRefreshRate、Caption/PNPDeviceID
+		bstr_t(L"SELECT Name, DriverVersion, CurrentRefreshRate, Caption, PNPDeviceID FROM Win32_VideoController"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+		nullptr, &pEnumerator);
+	if (FAILED(hres)) {
+
+		return "[DISPLAY][/DISPLAY]";
+	}
+
+	// 获取查询结果
+	ULONG uReturn = 0;
+	wstringstream ostr;
+	while (pEnumerator) {
+		IWbemClassObject* obj = nullptr; ULONG ret = 0;
+		hres = pEnumerator->Next(WBEM_INFINITE, 1, &obj, &ret);
+		if (ret == 0 || !obj) break;
+
+		std::wstring name = GetBstrProp(obj, L"Name");            // DCDN
+		std::wstring drv = GetBstrProp(obj, L"DriverVersion");   // DCDV
+		ULONGLONG         hz = GetU64Prop(obj, L"CurrentRefreshRate"); // DCDF（Hz）
+		std::wstring cap = GetBstrProp(obj, L"Caption");
+		std::wstring pnpId = GetBstrProp(obj, L"PNPDeviceID");
+
+		// DCSID 优先用 PNPDeviceID
+		std::wstring dcsid = !pnpId.empty() ? pnpId : (!cap.empty() ? cap : name);
+
+		// 若某些驱动返回 0，可按需改为默认 60
+		if (hz <= 0) hz = 60;
+
+		ostr << L"<DCDN>" << (name.empty() ? L"UNKNOWN" : name) << L"</DCDN>"
+			<< L"<DCDF>" << hz << L"</DCDF>"
+			<< L"<DCDV>" << (drv.empty() ? L"UNKNOWN" : drv) << L"</DCDV>"
+			<< L"<DCSID>" << (dcsid.empty() ? L"UNKNOWN" : dcsid) << L"</DCSID>\r\n";
+
+		obj->Release();
+
+	}
+
+	// 清理
+	pEnumerator->Release();
+	return "[DISPLAY]" + wStrToStr(ostr.str()) + "[/DISPLAY]";
+
+}
+
+
+
+// 获取 monitor 信息
+string queryMonitor() {
+
+	wstringstream ostr;
+	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	if (FAILED(hr)) 	return "[MONITOR]" + wStrToStr(ostr.str()) + "[/MONITOR]";;
+
+	hr = CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+		RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+		nullptr, EOAC_NONE, nullptr);
+	// 若返回已初始化，可忽略
+
+	IWbemLocator* pLoc = nullptr;
+	hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER,
+		IID_IWbemLocator, (LPVOID*)&pLoc);
+	if (FAILED(hr) || !pLoc) { CoUninitialize();	return "[MONITOR]" + wStrToStr(ostr.str()) + "[/MONITOR]";
+	}
+
+	IWbemServices* pSvc = nullptr;
+	// 注意：监视器信息在 root\WMI 命名空间
+	hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\WMI"), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
+	if (FAILED(hr) || !pSvc) { pLoc->Release(); CoUninitialize(); 	return "[MONITOR]" + wStrToStr(ostr.str()) + "[/MONITOR]"; }
+	// 3) 建议用 CreateInstanceEnum 直接枚举（比 ExecQuery 更稳）
+	IEnumWbemClassObject* pEnum = nullptr;
+	hr = pSvc->CreateInstanceEnum(_bstr_t(L"WmiMonitorID"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+		nullptr, &pEnum);
+
+	// 4) 也对 pEnum 设一次 blanket（关键）
+	CoSetProxyBlanket(pEnum, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+		RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+
+
+	// 获取查询结果
+	ULONG uReturn = 0;
+
+	while (pEnum) {
+		IWbemClassObject* obj = nullptr; ULONG ret = 0;
+		hr = pEnum->Next(WBEM_INFINITE, 1, &obj, &ret);
+		if (ret == 0 || !obj) break;
+
+		bool active = GetBoolProp(obj, L"Active", true);
+		std::wstring inst = GetBstrProp(obj, L"InstanceName");
+		ULONG wk = GetULongProp(obj, L"WeekOfManufacture");
+		ULONG yr = GetULongProp(obj, L"YearOfManufacture");
+
+		ostr << L"<WMIDA>" << (active ? L"True" : L"False") << L"</WMIDA>";
+		ostr << L"<WMIDIN>" << (inst.empty() ? L"UNKNOWN" : inst) << L"</WMIDIN>";
+
+		ostr << L"<WMIDMN>"<< GetUInt16ArrayStrProp(obj, L"ManufacturerName");
+		ostr<< L"</WMIDMN>";
+		ostr << L"<WMIDPCID>" << GetUInt16ArrayStrProp(obj, L"ProductCodeID");
+		ostr << L"</WMIDPCID>";
+		ostr << L"<WMIDSNID>" << GetUInt16ArrayStrProp(obj, L"SerialNumberID");
+		ostr << L"</WMIDSNID>";
+		ostr << L"<WMIDUFN>" << GetUInt16ArrayStrProp(obj, L"UserFriendlyName");
+		ostr<< L"</WMIDUFN>";
+		ostr << L"<WMIDWM>" << wk << L"</WMIDWM>";
+		ostr << L"<WMIDYM>" << yr << L"</WMIDYM>\r\n";
+		obj->Release();
+	}
+
+	// 清理
+	pEnum->Release();
+	return "[MONITOR]" + wStrToStr(ostr.str()) + "[/MONITOR]";
+
+}
+
+
+// 解析 SMBIOS 原始表，找到 Type 1（System Information），提取 UUID 的 16 字节
+static bool ExtractUuidFromSMBIOS(const std::vector<uint8_t>& data, std::vector<uint8_t>& uuid16) {
+	size_t i = 0;
+	while (i + 4 <= data.size()) {
+		// 结构头：Type(1) Length(1) Handle(2)
+		uint8_t type = data[i + 0];
+		uint8_t len = data[i + 1];
+		if (len < 4 || i + len > data.size()) break;
+
+		if (type == 1) { // System Information (Type 1)
+			// UUID 按规范在 offset 0x08 起 16 字节（SMBIOS 2.6+）
+			if (len >= 0x18 && i + 0x08 + 16 <= data.size()) {
+				uuid16.assign(data.begin() + i + 0x08, data.begin() + i + 0x08 + 16);
+				return true;
+			}
+		}
+
+		// 跳过格式化区后面跟随的字符串集合，直到遇到双 0 结束
+		size_t j = i + len; // 字符串区起点
+		while (j + 1 < data.size()) {
+			if (data[j] == 0x00 && data[j + 1] == 0x00) { j += 2; break; }
+			// 跳过一个以 0 结尾的字符串
+			while (j < data.size() && data[j] != 0x00) ++j;
+			if (j < data.size() && data[j] == 0x00) ++j;
+		}
+		i = j;
+	}
+	return false;
+}
+
+
+// 获取 bios 信息
+string querySmbios() {
+
+	std::wstringstream ostr;
+	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	if (FAILED(hr)) return "[SMBIOSUUID][/SMBIOSUUID]";
+
+	hr = CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+		RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+		nullptr, EOAC_NONE, nullptr); // 若已初始化可忽略返回
+
+	IWbemLocator* pLoc = nullptr;
+	hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+	if (FAILED(hr) || !pLoc) { CoUninitialize(); return "[SMBIOSUUID][/SMBIOSUUID]"; }
+
+	// 关键：ROOT\WMI
+	IWbemServices* pSvc = nullptr;
+	hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\WMI"), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
+	if (FAILED(hr) || !pSvc) { pLoc->Release(); CoUninitialize(); return "[SMBIOSUUID][/SMBIOSUUID]"; }
+
+	hr = CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+		RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+	if (FAILED(hr)) { pSvc->Release(); pLoc->Release(); CoUninitialize(); return "[SMBIOSUUID][/SMBIOSUUID]"; }
+
+	IEnumWbemClassObject* pEnum = nullptr;
+	// 读取原始 SMBIOS 表
+	hr = pSvc->ExecQuery(bstr_t(L"WQL"),
+		bstr_t(L"SELECT SMBiosData FROM MSSmBios_RawSMBiosTables"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
+	if (FAILED(hr) || !pEnum) { pSvc->Release(); pLoc->Release(); CoUninitialize(); return "[SMBIOSUUID][/SMBIOSUUID]"; }
+
+	// 对枚举器也设一次 blanket（有些环境必要）
+	CoSetProxyBlanket(pEnum, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+		RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+
+	IWbemClassObject* obj = nullptr; ULONG ret = 0;
+	hr = pEnum->Next(WBEM_INFINITE, 1, &obj, &ret);
+	if (FAILED(hr) || ret == 0 || !obj) {
+		if (pEnum) pEnum->Release(); pSvc->Release(); pLoc->Release(); CoUninitialize();
+		return "[SMBIOSUUID]" + wStrToStr(ostr.str()) + "[/SMBIOSUUID]";
+	}
+
+	// 取 SMBiosData（二进制 SAFEARRAY）
+	VARIANT vt; VariantInit(&vt);
+	std::vector<uint8_t> raw;
+	if (SUCCEEDED(obj->Get(L"SMBiosData", 0, &vt, nullptr, nullptr)) && SafeArrayToBytes(vt, raw)) {
+		std::vector<uint8_t> uuid16;
+		bool ok = ExtractUuidFromSMBIOS(raw, uuid16);
+
+		ostr << L"<SMBULA>" << (ok ? L"True" : L"False") << L"</SMBULA>";
+		ostr << L"<SMBULC>1</SMBULC>";
+		ostr << L"<SMBULIN>SMBiosData</SMBULIN>";
+		ostr << L"<SMBULLU>";
+		if (ok) {
+			for (size_t i = 0; i < uuid16.size(); ++i) {
+				if (i)ostr << L" ";
+				ostr << (unsigned)uuid16[i];
+			}
+		}
+		ostr << L"</SMBULLU>\r\n";
+	}
+	VariantClear(&vt);
+	obj->Release();
+
+	pEnum->Release();
+	pSvc->Release();
+	pLoc->Release();
+	CoUninitialize();
+	return "[SMBIOSUUID]"+wStrToStr(ostr.str()) + "[/SMBIOSUUID]";
+
 }
 
 
@@ -802,74 +1196,138 @@ string GetCPUInfo(IWbemServices* pSvc) {
 	// 获取查询结果
 	IWbemClassObject* pclsObj = NULL;
 	ULONG uReturn = 0;
-	int NumberOfCores = 0;
-	int NumberOfLogicalProcessors = 0;
-	wstring cpuNameText = L"";
-	wstring deviceIdText = L"";
-	string result = "";
+	ULONGLONG NumberOfCores = 0;
+	ULONGLONG NumberOfLogicalProcessors = 0;
+	std::wstringstream cpuStr;
+	wstringstream sysStr;
 	while (pEnumerator) {
 		hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
 		if (0 == uReturn) break;
 
 		VARIANT vtProp;
+		wstring PN = GetBstrProp(pclsObj, L"Name");
+		wstring PDID = GetBstrProp(pclsObj, L"DeviceId");
+		ULONGLONG NumberOfCoresTemp = GetU64Prop(pclsObj, L"NumberOfCores");
+		if (NumberOfCoresTemp)
+		{
+			NumberOfCores = NumberOfCores + NumberOfCoresTemp;
+		}
 
-		hres = pclsObj->Get(L"Name", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-			cpuNameText = std::wstring(vtProp.bstrVal);
+		ULONGLONG NumberOfLogicalProcessorsTemp = GetU64Prop(pclsObj, L"NumberOfLogicalProcessors");
+		if (NumberOfLogicalProcessorsTemp)
+		{
+			NumberOfLogicalProcessors = NumberOfLogicalProcessors + NumberOfLogicalProcessorsTemp;
+		}
 
-		}
-		VariantClear(&vtProp);
 
-		hres = pclsObj->Get(L"DeviceId", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-		
-			deviceIdText = std::wstring(vtProp.bstrVal);
-		}
-		VariantClear(&vtProp);
-		string NumberOfCoresText = "";
-		// 获取物理核心数
-		hres = pclsObj->Get(L"NumberOfCores", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
-				continue;
-			}
-			NumberOfCores = NumberOfCores + vtProp.intVal;
-			NumberOfCoresText = "<PNC>" + std::to_string(vtProp.intVal) + "</PNC>";
-
-		}
-		else {
-			NumberOfCoresText = "<PNC>0</PNC>";
-		}
-		VariantClear(&vtProp);
-		string NumberOfLogicalProcessorsText = "";
-		// 获取逻辑核心数
-		hres = pclsObj->Get(L"NumberOfLogicalProcessors", 0, &vtProp, 0, 0);
-		if (SUCCEEDED(hres)) {
-			if (vtProp.vt == VT_EMPTY || vtProp.vt == VT_NULL) {
-				continue;
-			}
-			NumberOfLogicalProcessors = NumberOfLogicalProcessors + vtProp.intVal;
-			NumberOfLogicalProcessorsText = "<PNLP>" + std::to_string(vtProp.intVal) + "</PNLP>";
-		}
-		else {
-			NumberOfLogicalProcessorsText = "<PNLP>0</PNLP>";
-		}
-		
-		VariantClear(&vtProp);
-
-		std::wstring wideStr(L"<PDID>" + deviceIdText + L"</PDID><PN>" + cpuNameText + L"</PN>" );
-		int size_needed = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-		std::string result2(size_needed, 0);
-		WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &result2[0], size_needed, nullptr, nullptr);
-		result = result + result2 + NumberOfCoresText+ NumberOfLogicalProcessorsText+"\r\n";
+		//<PDID>CPU0</PDID><PN>11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz</PN><PNC>8</PNC><PNEC>8</PNEC><PNLP>16</PNLP>
+		cpuStr << L"<PDID>" << PDID << "</PDID><PN>" << PN << "</PN><PNC>" << NumberOfCoresTemp << "</PNC><PNEC>" << NumberOfCoresTemp << "</PNEC><PNLP>" << NumberOfLogicalProcessorsTemp << "</PNLP>\r\n";
 		pclsObj->Release();
-
 	}
+	sysStr << L"[SYS]<CSNP>" << NumberOfCores << "</CSNP><CSNLP>" << NumberOfLogicalProcessors << "</CSNLP>[/SYS]\r\n"
+		<< "[CPU]" << cpuStr.str() << "[/CPU]";
 
 	// 清理
 	pEnumerator->Release();
-	return "[SYS]<CSNP>" + std::to_string(NumberOfCores) + "</CSNP><CSNLP>" + std::to_string(NumberOfLogicalProcessors) + "</CSNLP>[/SYS]\r\n[CPU]"+ result+"[/CPU]";
+	return wStrToStr(sysStr.str());
+
 }
+
+
+// 根据 PNPDeviceID 回退查询 PhysicalMedia.SerialNumber（某些品牌 DiskDrive.SerialNumber 为空）
+static std::wstring QueryPhysicalMediaSerialByPNP(IWbemServices* pSvc, const std::wstring& pnpId) {
+	if (pnpId.empty()) return L"";
+	// 注意：Win32_PhysicalMedia.Tag 通常与 Win32_DiskDrive.DeviceID 或 PNP 相关，但供应商实现各异
+	// 更稳妥做法：直接 SELECT * FROM Win32_PhysicalMedia 然后尝试匹配 SerialNumber 不为空的项
+	IEnumWbemClassObject* pEnum = nullptr;
+	HRESULT hr = pSvc->ExecQuery(
+		bstr_t(L"WQL"),
+		bstr_t(L"SELECT SerialNumber FROM Win32_PhysicalMedia"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+		nullptr, &pEnum);
+	if (FAILED(hr) || !pEnum) return L"";
+
+	std::wstring serial;
+	while (true) {
+		IWbemClassObject* obj = nullptr; ULONG ret = 0;
+		hr = pEnum->Next(WBEM_INFINITE, 1, &obj, &ret);
+		if (ret == 0 || !obj) break;
+		std::wstring s = GetBstrProp(obj, L"SerialNumber");
+		if (!s.empty()) { serial = s; obj->Release(); break; }
+		obj->Release();
+	}
+	if (pEnum) pEnum->Release();
+	return serial;
+}
+
+
+string QueryDiskDrives(IWbemServices* pSvc) {
+	HRESULT hres;
+
+	// 查询磁盘的 WMI 查询语句
+	IEnumWbemClassObject* pEnumerator = NULL;
+	hres = pSvc->ExecQuery(
+		BSTR(L"WQL"),
+		BSTR(L"SELECT * FROM Win32_DiskDrive"),
+		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+		NULL,
+		&pEnumerator);
+	if (FAILED(hres)) {
+
+		return "[DISK][/DISK]";
+	}
+
+	// 获取磁盘信息
+	IWbemClassObject* pclsObj = NULL;
+	ULONG uReturn = 0;
+	std::wstring diskListText;
+	while (pEnumerator) {
+		IWbemClassObject* obj = nullptr; ULONG ret = 0;
+		hres = pEnumerator->Next(WBEM_INFINITE, 1, &obj, &ret);
+		if (ret == 0 || !obj) break;
+
+		std::wstring status = GetBstrProp(obj, L"Status");           // "OK" / "Degraded" 等
+		bool         loaded = GetBoolProp(obj, L"MediaLoaded", true);// 是否有介质（SSD/HDD 固定介质通常为 true）
+		std::wstring did = GetBstrProp(obj, L"DeviceID");         // \\.\PHYSICALDRIVE0
+		std::wstring ifType = GetBstrProp(obj, L"InterfaceType");    // "IDE"/"SCSI"/"NVMe"/"USB" 等
+		std::wstring model = GetBstrProp(obj, L"Model");            // 型号
+		std::wstring fwrev = GetBstrProp(obj, L"FirmwareRevision"); // 固件版本
+		std::wstring sn = GetBstrProp(obj, L"SerialNumber");     // 某些厂商可能为空或有空格
+		ULONGLONG    size = GetU64Prop(obj, L"Size");              // 字节
+		std::wstring pnp = GetBstrProp(obj, L"PNPDeviceID");      // 需要时可输出
+
+		// 去掉序列号的尾部空白
+		if (!sn.empty()) {
+			while (!sn.empty() && (sn.back() == L' ' || sn.back() == L'\t')) sn.pop_back();
+		}
+		// 回退：如果 DiskDrive.SerialNumber 为空，用 PhysicalMedia.SerialNumber
+		if (sn.empty()) {
+			std::wstring alt = QueryPhysicalMediaSerialByPNP(pSvc, pnp);
+			if (!alt.empty()) sn = alt;
+		}
+
+		// 输出为你的标签格式
+		std::wstringstream diskText;
+		diskText << L"<DS>" << (status.empty() ? L"OK" : status) << L"</DS>"
+			<< L"<DL>" << (loaded ? L"True" : L"False") << L"</DL>"
+			<< L"<DID>" << did << L"</DID>"
+			<< L"<DIT>" << (ifType.empty() ? L"Unknown" : ifType) << L"</DIT>"
+			<< L"<DM>" << model << L"</DM>"
+			<< L"<DFR>" << fwrev << L"</DFR>"
+			<< L"<DSN>" << (sn.empty() ? L"UNKNOWN" : sn) << L"</DSN>"
+			<< L"<DSize>" << size << L"</DSize>";
+		diskListText = diskListText + diskText.str() + L"\r\n";
+		obj->Release();
+
+	}
+
+	pEnumerator->Release();
+
+	return "[DISK]" + wStrToStr(diskListText) + "[/DISK]";
+
+
+}
+
 
 // 释放资源
 void CleanUpWMI(IWbemServices* pSvc, IWbemLocator* pLoc) {
@@ -888,14 +1346,14 @@ void report() {
 	systemInfo.append("[" + windowVersion + "]\r\n");
 	//[SYS]<CSMf>HASEE Computer</CSMf><CSM>CNH5S</CSM><CSTPM>16948453376</CSTPM><CSNP>1</CSNP><CSNLP>16</CSNLP>
 	string sysProcessor = "";
-	string processorCoresInfoText =  GetCPUInfo(pSvc);
+	string processorCoresInfoText = GetCPUInfo(pSvc);
 	sysProcessor = sysProcessor + processorCoresInfoText;
 	systemInfo.append(sysProcessor);
 	//[UPTimeTick]750484[/UPTimeTick]
 	//[UPTime] 0d0h12m30s[/ UPTime]
-	string systemUpTimeText =  "\r\n[UPTime]"+GetSystemUptime()+"[/UPTime]";
-	string systemInstallDateText =  "\r\n[OSInstallDate]" +  GetInstallDate() + "[/OSInstallDate]";
-	systemInfo.append(systemUpTimeText + systemInstallDateText+"\r\n");
+	string systemUpTimeText = "\r\n[UPTime]" + GetSystemUptime() + "[/UPTime]";
+	string systemInstallDateText = "\r\n[OSInstallDate]" + GetInstallDate() + "[/OSInstallDate]";
+	systemInfo.append(systemUpTimeText + systemInstallDateText + "\r\n");
 	//[NA] <NAPN>WAN Miniport(IP) < / NAPN > <NAPA>False< / NAPA>
 	//	<NAPN>WAN Miniport(IPv6) < / NAPN > <NAPA>False< / NAPA>
 	//	<NAPN>Intel(R) Wireless - AC 9462 < / NAPN > <NAPA>True< / NAPA>
@@ -904,11 +1362,39 @@ void report() {
 	//	<NAPN>Microsoft Wi - Fi Direct Virtual Adapter< / NAPN><NAPA>False< / NAPA>
 	//	<NAPN>Intel(R) Ethernet Connection(14) I219 - V< / NAPN><NAPA>True< / NAPA>
 	//	<NAPN>Bluetooth Device(Personal Area Network) < / NAPN > <NAPA>True< / NAPA>
-	string networkAdaptersText =   QueryNetworkAdapters(pSvc);
-	systemInfo.append(networkAdaptersText);
+	string networkAdaptersText = QueryNetworkAdapters(pSvc);
+	systemInfo.append(networkAdaptersText + "\r\n");
+	//[GPU]<GN></GN><GID></GID>[/GPU]
+
+	string GpuText = QueryGPU(pSvc);
+	systemInfo.append(GpuText + "\r\n");
+	/*[DISK] <DS>OK< / DS><DL>True< / DL><DID>\\.\PHYSICALDRIVE0< / DID><DIT>IDE< / DIT><DM>M.2 SATA M1912 - 1TB< / DM><DFR>V0915A0< / DFR><DSN>XLXWKWY2022001425< / DSN> < DSize>1024203640320 < / DSize >
+		<DS>OK< / DS><DL>True< / DL><DID>\\.\PHYSICALDRIVE1< / DID><DIT>SCSI< / DIT><DM>KINGSTON SNV3S500G< / DM><DFR>SDQ00103< / DFR> < DSN>0000_0000_0000_0000_0026_B728_371C_6E95.< / DSN> < DSize>500105249280 < / DSize >
+		[/ DISK]*/
+	string diskText = QueryDiskDrives(pSvc);
+	systemInfo.append(diskText + "\r\n");
+	string displayText = queryDisplay(pSvc);
+	systemInfo.append(displayText+"\r\n");
+	CleanUpWMI(pSvc, pLoc);
+	/*[MONITOR] <WMIDA>True< / WMIDA><WMIDIN>DISPLAY\CMN1521\4 & 38d80a36 & 0 & UID8388688_0< / WMIDIN> < WMIDMN>67 77 78 0 0 0 0 0 0 0 0 0 0 0 0 0 < / WMIDMN > < WMIDPCID>49 53 50 49 0 0 0 0 0 0 0 0 0 0 0 0 < / WMIDPCID > < WMIDSNID>48 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 < / WMIDSNID > < WMIDWM>1 < / WMIDWM > < WMIDYM>2020 < / WMIDYM >
+		<WMIDA>True< / WMIDA><WMIDIN>DISPLAY\SGTBC32\4 & 38d80a36 & 0 & UID4145_0< / WMIDIN> < WMIDMN>83 71 84 0 0 0 0 0 0 0 0 0 0 0 0 0 < / WMIDMN > < WMIDPCID>66 67 51 50 0 0 0 0 0 0 0 0 0 0 0 0 < / WMIDPCID > < WMIDSNID>49 54 56 52 51 48 48 57 0 0 0 0 0 0 0 0 < / WMIDSNID > < WMIDUFN>72 68 77 73 0 0 0 0 0 0 0 0 0 < / WMIDUFN > < WMIDWM>25 < / WMIDWM > < WMIDYM>2023 < / WMIDYM >
+		[/ MONITOR]*/
+	string monitor = queryMonitor();
+	systemInfo.append(monitor+"\r\n");
+		/*[SMBIOSUUID]<SMBULA>True< / SMBULA> < SMBULC>1 < / SMBULC > <SMBULIN>SMBiosData< / SMBULIN> < SMBULLU>0 0 150 240 0 0 0 16 128 0 0 224 76 142 197 223 < / SMBULLU >
+			[/ SMBIOSUUID]*/
+	 string smbios = querySmbios();
+	 systemInfo.append(smbios+"\r\n");
+
+	 InitializeWMI(&pSvc, &pLoc);
+	 string bios = QueryBIOS(pSvc);
+	 systemInfo.append(bios);
+
+
 	std::cout << systemInfo << std::endl;
 
-	CleanUpWMI(pSvc, pLoc);
+
+		CleanUpWMI(pSvc, pLoc);
 	return;
 
 
